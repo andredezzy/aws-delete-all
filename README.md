@@ -23,7 +23,7 @@ This script will **DELETE ALL RESOURCES** in the specified AWS account. Use with
 
 ### Global Services (opt-in)
 - **Route 53**: Disables DNSSEC, deletes all record sets (except apex NS/SOA), disassociates VPCs from private zones, and deletes hosted zones
-- **IAM**: Deletes identity providers (OIDC/SAML, excludes those with "aws" or "DO_NOT_DELETE" in name), deletes roles (excludes those starting with "AWS"), detaches and deletes customer-managed policies (excludes AWS-managed policies)
+- **IAM**: Deletes identity providers (OIDC/SAML, excludes those with "aws" or "DO_NOT_DELETE" in name), deletes roles (excludes those starting with "AWS"), deletes instance profiles, detaches and deletes customer-managed policies (excludes AWS-managed policies)
 
 ## Prerequisites
 
@@ -46,7 +46,7 @@ The script requires extensive AWS permissions. Consider using a policy with the 
 - `elasticloadbalancing:*` (Classic Load Balancers)
 - `rds:*` (DB instances, clusters, snapshots, subnet groups)
 - `eks:*` (clusters, nodegroups, Fargate profiles, add-ons)
-- `iam:ListOpenIDConnectProviders`, `iam:GetOpenIDConnectProvider`, `iam:DeleteOpenIDConnectProvider`, `iam:ListSAMLProviders`, `iam:DeleteSAMLProvider`, `iam:ListRoles`, `iam:ListAttachedRolePolicies`, `iam:ListRolePolicies`, `iam:ListInstanceProfilesForRole`, `iam:DetachRolePolicy`, `iam:DeleteRolePolicy`, `iam:RemoveRoleFromInstanceProfile`, `iam:DeleteRole`, `iam:ListPolicies`, `iam:ListEntitiesForPolicy`, `iam:DetachUserPolicy`, `iam:DetachGroupPolicy`, `iam:ListPolicyVersions`, `iam:DeletePolicyVersion`, `iam:DeletePolicy` (for IAM cleanup)
+- `iam:ListOpenIDConnectProviders`, `iam:GetOpenIDConnectProvider`, `iam:DeleteOpenIDConnectProvider`, `iam:ListSAMLProviders`, `iam:DeleteSAMLProvider`, `iam:ListRoles`, `iam:ListAttachedRolePolicies`, `iam:ListRolePolicies`, `iam:ListInstanceProfilesForRole`, `iam:DetachRolePolicy`, `iam:DeleteRolePolicy`, `iam:RemoveRoleFromInstanceProfile`, `iam:DeleteRole`, `iam:ListInstanceProfiles`, `iam:DeleteInstanceProfile`, `iam:ListPolicies`, `iam:ListEntitiesForPolicy`, `iam:DetachUserPolicy`, `iam:DetachGroupPolicy`, `iam:ListPolicyVersions`, `iam:DeletePolicyVersion`, `iam:DeletePolicy` (for IAM cleanup)
 - `route53:*` (if using `--include-route53`)
 - `sts:GetCallerIdentity`
 
@@ -249,6 +249,9 @@ MODE: DRY-RUN (no delete calls will be made)
 [DRY-RUN] Delete inline policy from role: MyInlinePolicy from MyCustomRole
 [DRY-RUN] Remove role from instance profile: MyCustomRole from MyInstanceProfile
 [DRY-RUN] Delete IAM Role: MyCustomRole
+[DRY-RUN] IAM Instance Profile cleanup: MyInstanceProfile
+[DRY-RUN] Remove role from instance profile: MyCustomRole from MyInstanceProfile
+[DRY-RUN] Delete IAM Instance Profile: MyInstanceProfile
 [DRY-RUN] IAM Policy cleanup: MyCustomPolicy (arn:aws:iam::123456789012:policy/MyCustomPolicy)
 [DRY-RUN] Detach policy from role: MyCustomPolicy from MyRole
 [DRY-RUN] Delete IAM Policy: MyCustomPolicy (arn:aws:iam::123456789012:policy/MyCustomPolicy)

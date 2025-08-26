@@ -17,7 +17,7 @@ Per-region cleanup:
 
 Global (opt-in):
 - Route 53: disable DNSSEC (if enabled), delete ALL record sets except apex NS/SOA, disassociate VPCs (private zones), then delete hosted zones
-- IAM: deletes identity providers (OIDC/SAML, excludes those with "aws" or "DO_NOT_DELETE" in name), deletes roles (excludes those starting with "AWS"), detaches and deletes customer-managed policies
+- IAM: deletes identity providers (OIDC/SAML, excludes those with "aws" or "DO_NOT_DELETE" in name), deletes roles (excludes those starting with "AWS"), deletes instance profiles, detaches and deletes customer-managed policies
 
 Usage examples:
   python aws_cleanup.py
@@ -674,6 +674,29 @@ def cleanup_iam(actually: bool):
                 print(action_line(actually, "Delete IAM Role", f"{role_name}"))
                 if actually:
                     safe_call(iam.delete_role, RoleName=role_name)
+    except ClientError:
+        pass
+    
+    # Delete IAM instance profiles
+    try:
+        paginator = iam.get_paginator("list_instance_profiles")
+        for page in paginator.paginate():
+            for profile in page.get("InstanceProfiles", []):
+                profile_name = profile["InstanceProfileName"]
+                
+                print(action_line(actually, "IAM Instance Profile cleanup", f"{profile_name}"))
+                
+                # Remove all roles from the instance profile first
+                for role in profile.get("Roles", []):
+                    role_name = role["RoleName"]
+                    print(action_line(actually, "Remove role from instance profile", f"{role_name} from {profile_name}"))
+                    if actually:
+                        safe_call(iam.remove_role_from_instance_profile, InstanceProfileName=profile_name, RoleName=role_name)
+                
+                # Delete the instance profile
+                print(action_line(actually, "Delete IAM Instance Profile", f"{profile_name}"))
+                if actually:
+                    safe_call(iam.delete_instance_profile, InstanceProfileName=profile_name)
     except ClientError:
         pass
     
