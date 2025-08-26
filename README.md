@@ -23,7 +23,7 @@ This script will **DELETE ALL RESOURCES** in the specified AWS account. Use with
 
 ### Global Services (opt-in)
 - **Route 53**: Disables DNSSEC, deletes all record sets (except apex NS/SOA), disassociates VPCs from private zones, and deletes hosted zones
-- **IAM**: Deletes identity providers (OIDC/SAML, excludes those with "aws" or "DO_NOT_DELETE" in name), detaches and deletes customer-managed policies (excludes AWS-managed policies)
+- **IAM**: Deletes identity providers (OIDC/SAML, excludes those with "aws" or "DO_NOT_DELETE" in name), deletes roles (excludes those starting with "AWS"), detaches and deletes customer-managed policies (excludes AWS-managed policies)
 
 ## Prerequisites
 
@@ -46,7 +46,7 @@ The script requires extensive AWS permissions. Consider using a policy with the 
 - `elasticloadbalancing:*` (Classic Load Balancers)
 - `rds:*` (DB instances, clusters, snapshots, subnet groups)
 - `eks:*` (clusters, nodegroups, Fargate profiles, add-ons)
-- `iam:ListOpenIDConnectProviders`, `iam:GetOpenIDConnectProvider`, `iam:DeleteOpenIDConnectProvider`, `iam:ListSAMLProviders`, `iam:DeleteSAMLProvider`, `iam:ListPolicies`, `iam:ListEntitiesForPolicy`, `iam:DetachRolePolicy`, `iam:DetachUserPolicy`, `iam:DetachGroupPolicy`, `iam:ListPolicyVersions`, `iam:DeletePolicyVersion`, `iam:DeletePolicy` (for IAM cleanup)
+- `iam:ListOpenIDConnectProviders`, `iam:GetOpenIDConnectProvider`, `iam:DeleteOpenIDConnectProvider`, `iam:ListSAMLProviders`, `iam:DeleteSAMLProvider`, `iam:ListRoles`, `iam:ListAttachedRolePolicies`, `iam:ListRolePolicies`, `iam:ListInstanceProfilesForRole`, `iam:DetachRolePolicy`, `iam:DeleteRolePolicy`, `iam:RemoveRoleFromInstanceProfile`, `iam:DeleteRole`, `iam:ListPolicies`, `iam:ListEntitiesForPolicy`, `iam:DetachUserPolicy`, `iam:DetachGroupPolicy`, `iam:ListPolicyVersions`, `iam:DeletePolicyVersion`, `iam:DeletePolicy` (for IAM cleanup)
 - `route53:*` (if using `--include-route53`)
 - `sts:GetCallerIdentity`
 
@@ -243,6 +243,12 @@ MODE: DRY-RUN (no delete calls will be made)
 === Global: IAM ===
 [DRY-RUN] Delete OIDC Identity Provider: my-oidc-provider (arn:aws:iam::123456789012:oidc-provider/my-oidc-provider)
 [DRY-RUN] Skip SAML Provider (protected): aws-sso-provider (arn:aws:iam::123456789012:saml-provider/aws-sso-provider)
+[DRY-RUN] Skip IAM Role (AWS service role): AWSServiceRoleForECS
+[DRY-RUN] IAM Role cleanup: MyCustomRole
+[DRY-RUN] Detach managed policy from role: AmazonS3ReadOnlyAccess from MyCustomRole
+[DRY-RUN] Delete inline policy from role: MyInlinePolicy from MyCustomRole
+[DRY-RUN] Remove role from instance profile: MyCustomRole from MyInstanceProfile
+[DRY-RUN] Delete IAM Role: MyCustomRole
 [DRY-RUN] IAM Policy cleanup: MyCustomPolicy (arn:aws:iam::123456789012:policy/MyCustomPolicy)
 [DRY-RUN] Detach policy from role: MyCustomPolicy from MyRole
 [DRY-RUN] Delete IAM Policy: MyCustomPolicy (arn:aws:iam::123456789012:policy/MyCustomPolicy)

@@ -17,7 +17,7 @@ Per-region cleanup:
 
 Global (opt-in):
 - Route 53: disable DNSSEC (if enabled), delete ALL record sets except apex NS/SOA, disassociate VPCs (private zones), then delete hosted zones
-- IAM: deletes identity providers (OIDC/SAML, excludes those with "aws" or "DO_NOT_DELETE" in name), detaches and deletes customer-managed policies
+- IAM: deletes identity providers (OIDC/SAML, excludes those with "aws" or "DO_NOT_DELETE" in name), deletes roles (excludes those starting with "AWS"), detaches and deletes customer-managed policies
 
 Usage examples:
   python aws_cleanup.py
@@ -410,6 +410,7 @@ def cleanup_vpcs(region: str, actually: bool):
 # ---------------- RDS ----------------
 def cleanup_rds(region: str, actually: bool, final_snapshot_prefix: str|None):
     rds = boto3.client("rds", region_name=region, config=CFG)
+    deleted_resources = False  # Track if we actually deleted any RDS resources
 
     # Clusters (Aurora)
     try:
@@ -429,7 +430,9 @@ def cleanup_rds(region: str, actually: bool, final_snapshot_prefix: str|None):
                       "SkipFinalSnapshot": False}
         print(action_line(actually, "Delete RDS Cluster", f"{region} {cid}"))
         if actually:
-            safe_call(rds.delete_db_cluster, **kwargs)
+            result = safe_call(rds.delete_db_cluster, **kwargs)
+            if result:  # Only set if deletion was successful
+                deleted_resources = True
 
     # Instances not in clusters
     try:
@@ -451,7 +454,9 @@ def cleanup_rds(region: str, actually: bool, final_snapshot_prefix: str|None):
                       "SkipFinalSnapshot": False}
         print(action_line(actually, "Delete RDS Instance", f"{region} {iid}"))
         if actually:
-            safe_call(rds.delete_db_instance, **kwargs)
+            result = safe_call(rds.delete_db_instance, **kwargs)
+            if result:  # Only set if deletion was successful
+                deleted_resources = True
 
     # Snapshots (manual + cluster)
     try:
@@ -474,14 +479,31 @@ def cleanup_rds(region: str, actually: bool, final_snapshot_prefix: str|None):
         if actually:
             safe_call(rds.delete_db_cluster_snapshot, DBClusterSnapshotIdentifier=sid)
 
-    # Subnet groups (best-effort)
+    # Wait for DB instances/clusters to be fully deleted before deleting subnet groups
+    # Only wait if we actually deleted RDS resources
+    if actually and deleted_resources:
+        print(f"  Waiting for RDS resources to be fully deleted in {region}...")
+        time.sleep(30)  # Give some time for deletions to propagate
+    
+    # Subnet groups (best-effort with retry)
     try:
         sgs = rds.describe_db_subnet_groups()["DBSubnetGroups"]
         for sg in sgs:
             name = sg["DBSubnetGroupName"]
             print(action_line(actually, "Delete RDS Subnet Group", f"{region} {name}"))
             if actually:
-                safe_call(rds.delete_db_subnet_group, DBSubnetGroupName=name)
+                # Retry subnet group deletion up to 3 times with delays
+                for attempt in range(3):
+                    try:
+                        rds.delete_db_subnet_group(DBSubnetGroupName=name)
+                        break
+                    except ClientError as e:
+                        if "InvalidDBSubnetGroupStateFault" in str(e) and attempt < 2:
+                            print(f"  Subnet group {name} still in use, waiting 30s (attempt {attempt + 1}/3)...")
+                            time.sleep(30)
+                        else:
+                            print(f"  ! Failed to delete subnet group {name}: {e}", file=sys.stderr)
+                            break
     except ClientError:
         pass
 
@@ -599,6 +621,59 @@ def cleanup_iam(actually: bool):
             print(action_line(actually, "Delete SAML Identity Provider", f"{provider_name} ({arn})"))
             if actually:
                 safe_call(iam.delete_saml_provider, SAMLProviderArn=arn)
+    except ClientError:
+        pass
+    
+    # Delete IAM roles (exclude AWS service roles)
+    try:
+        paginator = iam.get_paginator("list_roles")
+        for page in paginator.paginate():
+            for role in page.get("Roles", []):
+                role_name = role["RoleName"]
+                
+                # Skip if starts with "AWS" (case sensitive)
+                if role_name.startswith("AWS"):
+                    print(action_line(False, "Skip IAM Role (AWS service role)", f"{role_name}"))
+                    continue
+                
+                print(action_line(actually, "IAM Role cleanup", f"{role_name}"))
+                
+                # Detach managed policies
+                try:
+                    attached_policies = iam.list_attached_role_policies(RoleName=role_name).get("AttachedPolicies", [])
+                    for policy in attached_policies:
+                        policy_arn = policy["PolicyArn"]
+                        print(action_line(actually, "Detach managed policy from role", f"{policy['PolicyName']} from {role_name}"))
+                        if actually:
+                            safe_call(iam.detach_role_policy, RoleName=role_name, PolicyArn=policy_arn)
+                except ClientError:
+                    pass
+                
+                # Delete inline policies
+                try:
+                    inline_policies = iam.list_role_policies(RoleName=role_name).get("PolicyNames", [])
+                    for policy_name in inline_policies:
+                        print(action_line(actually, "Delete inline policy from role", f"{policy_name} from {role_name}"))
+                        if actually:
+                            safe_call(iam.delete_role_policy, RoleName=role_name, PolicyName=policy_name)
+                except ClientError:
+                    pass
+                
+                # Remove role from instance profiles
+                try:
+                    instance_profiles = iam.list_instance_profiles_for_role(RoleName=role_name).get("InstanceProfiles", [])
+                    for profile in instance_profiles:
+                        profile_name = profile["InstanceProfileName"]
+                        print(action_line(actually, "Remove role from instance profile", f"{role_name} from {profile_name}"))
+                        if actually:
+                            safe_call(iam.remove_role_from_instance_profile, InstanceProfileName=profile_name, RoleName=role_name)
+                except ClientError:
+                    pass
+                
+                # Finally delete the role
+                print(action_line(actually, "Delete IAM Role", f"{role_name}"))
+                if actually:
+                    safe_call(iam.delete_role, RoleName=role_name)
     except ClientError:
         pass
     
