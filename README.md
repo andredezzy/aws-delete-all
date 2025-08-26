@@ -9,7 +9,7 @@ This script will **DELETE ALL RESOURCES** in the specified AWS account. Use with
 ## Features
 
 ### Regional Services (cleaned per region)
-- **EC2**: Terminates instances, deletes available EBS volumes, deregisters AMIs and their snapshots, deletes remaining snapshots, releases Elastic IPs, and removes key pairs
+- **EC2**: Deletes Auto Scaling Groups (sets capacity to 0 first), terminates instances, deletes available EBS volumes, deregisters AMIs and their snapshots, deletes remaining snapshots, releases Elastic IPs, and removes key pairs
 - **Lambda**: Deletes all functions
 - **S3**: Empties and deletes buckets (handles both versioned and unversioned buckets, bucket-region aware)
 - **ECR**: Force deletes repositories and their images
@@ -39,6 +39,7 @@ This script will **DELETE ALL RESOURCES** in the specified AWS account. Use with
 
 The script requires extensive AWS permissions. Consider using a policy with the following actions:
 - `ec2:*` (instances, volumes, AMIs, snapshots, Elastic IPs, key pairs, ENIs, security groups, VPCs)
+- `autoscaling:*` (Auto Scaling Groups)
 - `s3:*` (buckets and objects)
 - `ecr:*` (repositories)
 - `lambda:*` (functions)
@@ -228,6 +229,9 @@ Regions: us-east-1, us-west-2, eu-west-1
 MODE: DRY-RUN (no delete calls will be made)
 
 === Region: us-east-1 ===
+[DRY-RUN] Auto Scaling Group cleanup: us-east-1 my-asg
+[DRY-RUN] Set ASG desired capacity to 0: us-east-1 my-asg
+[DRY-RUN] Delete Auto Scaling Group: us-east-1 my-asg
 [DRY-RUN] Terminate EC2 instances: us-east-1 ['i-1234567890abcdef0']
 [DRY-RUN] Delete EBS volume: us-east-1 vol-0123456789abcdef0
 [DRY-RUN] Delete Lambda function: us-east-1 my-function

@@ -3,7 +3,7 @@
 AWS Cleanup Script (DRY-RUN by default)
 
 Per-region cleanup:
-- EC2: instances, available EBS volumes, AMIs (+ snapshots), loose snapshots, Elastic IPs, key pairs
+- EC2: Auto Scaling Groups, instances, available EBS volumes, AMIs (+ snapshots), loose snapshots, Elastic IPs, key pairs
 - Lambda: functions
 - S3: empties versioned/unversioned buckets then deletes them (bucket-region aware)
 - ECR: repositories (force delete images)
@@ -65,6 +65,40 @@ def safe_call(fn, *a, **kw):
 
 def action_line(actually: bool, verb: str, resource: str) -> str:
     return ("" if actually else "[DRY-RUN] ") + f"{verb}: {resource}"
+
+# ---------------- Auto Scaling Groups ----------------
+def cleanup_autoscaling(region: str, actually: bool):
+    asg = boto3.client("autoscaling", region_name=region, config=CFG)
+    
+    try:
+        paginator = asg.get_paginator("describe_auto_scaling_groups")
+        for page in paginator.paginate():
+            for group in page.get("AutoScalingGroups", []):
+                group_name = group["AutoScalingGroupName"]
+                
+                print(action_line(actually, "Auto Scaling Group cleanup", f"{region} {group_name}"))
+                
+                # Set desired capacity to 0 first to terminate instances gracefully
+                if group["DesiredCapacity"] > 0:
+                    print(action_line(actually, "Set ASG desired capacity to 0", f"{region} {group_name}"))
+                    if actually:
+                        safe_call(asg.update_auto_scaling_group, 
+                                AutoScalingGroupName=group_name,
+                                DesiredCapacity=0,
+                                MinSize=0)
+                        
+                        # Wait a bit for instances to start terminating
+                        print(f"  Waiting for ASG {group_name} instances to terminate...")
+                        time.sleep(15)
+                
+                # Delete the Auto Scaling Group
+                print(action_line(actually, "Delete Auto Scaling Group", f"{region} {group_name}"))
+                if actually:
+                    safe_call(asg.delete_auto_scaling_group, 
+                            AutoScalingGroupName=group_name,
+                            ForceDelete=True)  # Force delete to handle remaining instances
+    except ClientError:
+        pass
 
 # ---------------- EC2 core ----------------
 def cleanup_ec2(region: str, actually: bool):
@@ -959,7 +993,8 @@ def cleanup_route53(actually: bool):
 # ---------------- Orchestration ----------------
 def per_region_worker(region: str, actually: bool, rds_final_snapshot_prefix: str|None):
     print(f"\n=== Region: {region} ===")
-    # Compute first
+    # Compute first (ASG before EC2 to handle dependencies)
+    cleanup_autoscaling(region, actually)
     cleanup_ec2(region, actually)
     cleanup_lambda(region, actually)
 
