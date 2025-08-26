@@ -8,12 +8,18 @@ Per-region cleanup:
 - S3: empties versioned/unversioned buckets then deletes them (bucket-region aware)
 - ECR: repositories (force delete images)
 - CloudWatch Logs: log groups
+- CloudWatch: alarms, dashboards
 - ACM: SSL/TLS certificates
+- API Gateway: REST APIs, HTTP APIs, WebSocket APIs, custom domains
+- DynamoDB: tables, global tables, backups
+- SQS: queues (standard and FIFO)
+- SNS: topics and subscriptions
 - ENI: deletes 'available' network interfaces
 - Security Groups: revokes rules, removes cross-references, deletes non-default SGs
 - Load Balancers: ALB/NLB (ELBv2) + Classic ELB, target groups
 - VPC teardown (best-effort, order-aware): endpoints, ELBs, NAT GWs, IGWs (detach), subnets, non-main route tables, non-default NACLs, peering, VPN attachments/GWs, then VPC
 - RDS: DB clusters & instances (removes deletion protection), snapshots, subnet groups
+- ECS: Capacity Providers, clusters
 - EKS: add-ons, fargate profiles, nodegroups, clusters; tries to remove IAM OIDC provider
 
 Global (opt-in):
@@ -44,6 +50,13 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError, WaiterError
 
+# Optional GUI support - will fallback to CLI if not available
+try:
+    import inquirer
+    GUI_AVAILABLE = True
+except ImportError:
+    GUI_AVAILABLE = False
+
 CFG = Config(retries={"max_attempts": 10, "mode": "standard"})
 MAX_WORKERS = 16
 
@@ -60,11 +73,63 @@ def safe_call(fn, *a, **kw):
     try:
         return fn(*a, **kw)
     except ClientError as e:
-        print(f"  ! {e}", file=sys.stderr)
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        error_msg = e.response.get('Error', {}).get('Message', str(e))
+        print(f"    {warning_line(f'{error_code}: {error_msg}')}", file=sys.stderr)
         return None
 
 def action_line(actually: bool, verb: str, resource: str) -> str:
-    return ("" if actually else "[DRY-RUN] ") + f"{verb}: {resource}"
+    """Format action line for consistent logging with clean aesthetics"""
+    if actually:
+        prefix = "🗑️"
+        color = "\033[91m"  # Red
+    else:
+        prefix = "📋"
+        color = "\033[94m"  # Blue
+    
+    reset = "\033[0m"  # Reset color
+    # Clean format: emoji + action + resource
+    return f"  {color}{prefix} {verb}{reset}: {resource}"
+
+def success_line(message: str) -> str:
+    """Format success line for completed actions"""
+    return f"\033[92m✅ {message}\033[0m"
+
+def error_line(message: str) -> str:
+    """Format error line for failed actions"""
+    return f"\033[91m❌ {message}\033[0m"
+
+def info_line(message: str) -> str:
+    """Format info line for general information"""
+    return f"\033[96m💡 {message}\033[0m"
+
+def warning_line(message: str) -> str:
+    """Format warning line for important notices"""
+    return f"\033[93m⚠️  {message}\033[0m"
+
+def section_header(title: str) -> str:
+    """Format clean section header"""
+    return f"\n\033[95m{'─' * 60}\033[0m\n\033[95m✨ {title}\033[0m\n\033[95m{'─' * 60}\033[0m"
+
+def service_header(service: str, region: str = None) -> str:
+    """Format service header with clean styling"""
+    location = f" ({region})" if region else ""
+    return f"\n\033[96m🔧 {service}{location}\033[0m"
+
+def summary_item(label: str, value: str) -> str:
+    """Format summary items consistently"""
+    return f"   • {label}: \033[97m{value}\033[0m"
+
+def skip_message(resource: str, reason: str) -> str:
+    """Format skip messages cleanly"""
+    return f"  \033[90m⏭️  Skipping {resource} ({reason})\033[0m"
+
+def count_message(service: str, count: int, resource_type: str) -> str:
+    """Format resource count messages"""
+    if count == 0:
+        return f"  \033[90m📭 No {resource_type} found in {service}\033[0m"
+    else:
+        return f"  \033[94m📊 Found {count} {resource_type} in {service}\033[0m"
 
 # ---------------- Auto Scaling Groups ----------------
 def cleanup_autoscaling(region: str, actually: bool):
@@ -97,6 +162,57 @@ def cleanup_autoscaling(region: str, actually: bool):
                     safe_call(asg.delete_auto_scaling_group, 
                             AutoScalingGroupName=group_name,
                             ForceDelete=True)  # Force delete to handle remaining instances
+    except ClientError:
+        pass
+
+# ---------------- ECS (Elastic Container Service) ----------------
+def cleanup_ecs(region: str, actually: bool):
+    ecs = boto3.client("ecs", region_name=region, config=CFG)
+    
+    # Delete ECS Clusters first (this will also delete services and tasks)
+    try:
+        paginator = ecs.get_paginator("list_clusters")
+        for page in paginator.paginate():
+            for cluster_arn in page.get("clusterArns", []):
+                cluster_name = cluster_arn.split("/")[-1]
+                
+                print(action_line(actually, "ECS Cluster cleanup", f"{region} {cluster_name}"))
+                
+                # List and stop all services in the cluster
+                try:
+                    services_paginator = ecs.get_paginator("list_services")
+                    for services_page in services_paginator.paginate(cluster=cluster_arn):
+                        for service_arn in services_page.get("serviceArns", []):
+                            service_name = service_arn.split("/")[-1]
+                            print(action_line(actually, "Delete ECS Service", f"{region} {cluster_name}/{service_name}"))
+                            if actually:
+                                # Set desired count to 0 first, then delete
+                                safe_call(ecs.update_service, cluster=cluster_arn, service=service_arn, desiredCount=0)
+                                safe_call(ecs.delete_service, cluster=cluster_arn, service=service_arn)
+                except ClientError:
+                    pass
+                
+                # Delete the cluster
+                print(action_line(actually, "Delete ECS Cluster", f"{region} {cluster_name}"))
+                if actually:
+                    safe_call(ecs.delete_cluster, cluster=cluster_arn)
+    except ClientError:
+        pass
+    
+    # Delete ECS Capacity Providers
+    try:
+        response = ecs.describe_capacity_providers()
+        for cp in response.get("capacityProviders", []):
+            cp_name = cp["name"]
+            
+            # Skip AWS-managed capacity providers
+            if cp_name.startswith("FARGATE"):
+                print(skip_message(f"capacity provider {cp_name}", "AWS-managed"))
+                continue
+            
+            print(action_line(actually, "Delete ECS Capacity Provider", f"{region} {cp_name}"))
+            if actually:
+                safe_call(ecs.delete_capacity_provider, capacityProvider=cp_name)
     except ClientError:
         pass
 
@@ -295,6 +411,169 @@ def cleanup_logs(region: str, actually: bool):
             print(action_line(actually, "Delete Log Group", f"{region} {name}"))
             if actually:
                 safe_call(logs.delete_log_group, logGroupName=name)
+
+# ---------------- CloudWatch ----------------
+def cleanup_cloudwatch(region: str, actually: bool):
+    cloudwatch = boto3.client("cloudwatch", region_name=region, config=CFG)
+    
+    # Delete CloudWatch Alarms
+    try:
+        paginator = cloudwatch.get_paginator("describe_alarms")
+        for page in paginator.paginate():
+            for alarm in page.get("MetricAlarms", []):
+                alarm_name = alarm["AlarmName"]
+                print(action_line(actually, "Delete CloudWatch Alarm", f"{region} {alarm_name}"))
+                if actually:
+                    safe_call(cloudwatch.delete_alarms, AlarmNames=[alarm_name])
+            
+            # Composite alarms
+            for alarm in page.get("CompositeAlarms", []):
+                alarm_name = alarm["AlarmName"]
+                print(action_line(actually, "Delete CloudWatch Composite Alarm", f"{region} {alarm_name}"))
+                if actually:
+                    safe_call(cloudwatch.delete_alarms, AlarmNames=[alarm_name])
+    except ClientError:
+        pass
+    
+    # Delete CloudWatch Dashboards
+    try:
+        paginator = cloudwatch.get_paginator("list_dashboards")
+        for page in paginator.paginate():
+            for dashboard in page.get("DashboardEntries", []):
+                dashboard_name = dashboard["DashboardName"]
+                print(action_line(actually, "Delete CloudWatch Dashboard", f"{region} {dashboard_name}"))
+                if actually:
+                    safe_call(cloudwatch.delete_dashboards, DashboardNames=[dashboard_name])
+    except ClientError:
+        pass
+
+# ---------------- API Gateway ----------------
+def cleanup_apigateway(region: str, actually: bool):
+    apigateway = boto3.client("apigateway", region_name=region, config=CFG)
+    apigatewayv2 = boto3.client("apigatewayv2", region_name=region, config=CFG)
+    
+    # Delete REST APIs (API Gateway v1)
+    try:
+        paginator = apigateway.get_paginator("get_rest_apis")
+        for page in paginator.paginate():
+            for api in page.get("items", []):
+                api_id = api["id"]
+                api_name = api.get("name", "unknown")
+                print(action_line(actually, "Delete API Gateway REST API", f"{region} {api_name} ({api_id})"))
+                if actually:
+                    safe_call(apigateway.delete_rest_api, restApiId=api_id)
+    except ClientError:
+        pass
+    
+    # Delete HTTP APIs and WebSocket APIs (API Gateway v2)
+    try:
+        paginator = apigatewayv2.get_paginator("get_apis")
+        for page in paginator.paginate():
+            for api in page.get("Items", []):
+                api_id = api["ApiId"]
+                api_name = api.get("Name", "unknown")
+                protocol_type = api.get("ProtocolType", "unknown")
+                print(action_line(actually, f"Delete API Gateway {protocol_type} API", f"{region} {api_name} ({api_id})"))
+                if actually:
+                    safe_call(apigatewayv2.delete_api, ApiId=api_id)
+    except ClientError:
+        pass
+    
+    # Delete Custom Domain Names (v1)
+    try:
+        paginator = apigateway.get_paginator("get_domain_names")
+        for page in paginator.paginate():
+            for domain in page.get("items", []):
+                domain_name = domain["domainName"]
+                print(action_line(actually, "Delete API Gateway Domain Name", f"{region} {domain_name}"))
+                if actually:
+                    safe_call(apigateway.delete_domain_name, domainName=domain_name)
+    except ClientError:
+        pass
+    
+    # Delete Custom Domain Names (v2)
+    try:
+        paginator = apigatewayv2.get_paginator("get_domain_names")
+        for page in paginator.paginate():
+            for domain in page.get("Items", []):
+                domain_name = domain["DomainName"]
+                print(action_line(actually, "Delete API Gateway v2 Domain Name", f"{region} {domain_name}"))
+                if actually:
+                    safe_call(apigatewayv2.delete_domain_name, DomainName=domain_name)
+    except ClientError:
+        pass
+
+# ---------------- DynamoDB ----------------
+def cleanup_dynamodb(region: str, actually: bool):
+    dynamodb = boto3.client("dynamodb", region_name=region, config=CFG)
+    
+    # Delete DynamoDB Tables
+    try:
+        paginator = dynamodb.get_paginator("list_tables")
+        for page in paginator.paginate():
+            for table_name in page.get("TableNames", []):
+                print(action_line(actually, "Delete DynamoDB Table", f"{region} {table_name}"))
+                if actually:
+                    # Remove deletion protection if enabled
+                    try:
+                        table_info = dynamodb.describe_table(TableName=table_name)
+                        if table_info.get("Table", {}).get("DeletionProtectionEnabled", False):
+                            print(action_line(actually, "Disable DynamoDB deletion protection", f"{region} {table_name}"))
+                            safe_call(dynamodb.update_table, 
+                                    TableName=table_name,
+                                    DeletionProtectionEnabled=False)
+                    except ClientError:
+                        pass
+                    
+                    safe_call(dynamodb.delete_table, TableName=table_name)
+    except ClientError:
+        pass
+    
+    # Delete DynamoDB Backups
+    try:
+        paginator = dynamodb.get_paginator("list_backups")
+        for page in paginator.paginate():
+            for backup in page.get("BackupSummaries", []):
+                backup_arn = backup["BackupArn"]
+                backup_name = backup.get("BackupName", "unknown")
+                if backup["BackupStatus"] == "AVAILABLE":
+                    print(action_line(actually, "Delete DynamoDB Backup", f"{region} {backup_name} ({backup_arn})"))
+                    if actually:
+                        safe_call(dynamodb.delete_backup, BackupArn=backup_arn)
+    except ClientError:
+        pass
+
+# ---------------- SQS ----------------
+def cleanup_sqs(region: str, actually: bool):
+    sqs = boto3.client("sqs", region_name=region, config=CFG)
+    
+    try:
+        paginator = sqs.get_paginator("list_queues")
+        for page in paginator.paginate():
+            for queue_url in page.get("QueueUrls", []):
+                queue_name = queue_url.split("/")[-1]
+                print(action_line(actually, "Delete SQS Queue", f"{region} {queue_name}"))
+                if actually:
+                    safe_call(sqs.delete_queue, QueueUrl=queue_url)
+    except ClientError:
+        pass
+
+# ---------------- SNS ----------------
+def cleanup_sns(region: str, actually: bool):
+    sns = boto3.client("sns", region_name=region, config=CFG)
+    
+    # Delete SNS Topics
+    try:
+        paginator = sns.get_paginator("list_topics")
+        for page in paginator.paginate():
+            for topic in page.get("Topics", []):
+                topic_arn = topic["TopicArn"]
+                topic_name = topic_arn.split(":")[-1]
+                print(action_line(actually, "Delete SNS Topic", f"{region} {topic_name} ({topic_arn})"))
+                if actually:
+                    safe_call(sns.delete_topic, TopicArn=topic_arn)
+    except ClientError:
+        pass
 
 # ---------------- ACM (Certificate Manager) ----------------
 def cleanup_acm(region: str, actually: bool):
@@ -927,26 +1206,39 @@ def route53_delete_rrsets_except_apex_ns_soa(r53, hosted_zone_id: str, zone_name
         nonlocal changes
         if not changes:
             return
+        
         if actually:
-            r53.change_resource_record_sets(
+            print(action_line(actually, "Delete DNS records", f"{len(changes)} records from {zone_name_with_dot}"))
+            safe_call(r53.change_resource_record_sets,
                 HostedZoneId=hosted_zone_id,
-                ChangeBatch={"Comment":"Zone cleanup","Changes":changes},
+                ChangeBatch={"Comment": "Zone cleanup", "Changes": changes}
             )
         else:
-            for ch in changes:
-                rr = ch["ResourceRecordSet"]
-                print(action_line(False, "Delete RRSet", f"{zone_name_with_dot} {rr.get('Type')} {rr.get('Name')}"))
+            print(action_line(False, "Delete DNS records", f"{len(changes)} records from {zone_name_with_dot}"))
         changes = []
 
-    for page in paginator.paginate(HostedZoneId=hosted_zone_id):
-        for rr in page["ResourceRecordSets"]:
-            name, rtype = rr["Name"], rr["Type"]
-            if (name == zone_name_with_dot) and (rtype in ("NS","SOA")):
-                continue
-            changes.append({"Action":"DELETE","ResourceRecordSet":rr})
-            if len(changes) == 100:
-                flush_changes()
-    flush_changes()
+    try:
+        for page in paginator.paginate(HostedZoneId=hosted_zone_id):
+            for rr in page["ResourceRecordSets"]:
+                name, rtype = rr["Name"], rr["Type"]
+                # Skip apex NS and SOA records (required for the zone)
+                if (name == zone_name_with_dot) and (rtype in ("NS", "SOA")):
+                    continue  # Skip silently - these are required
+                
+                changes.append({"Action": "DELETE", "ResourceRecordSet": rr})
+                
+                # Batch changes to avoid API limits
+                if len(changes) >= 100:
+                    flush_changes()
+        
+        # Delete any remaining changes
+        flush_changes()
+        
+    except ClientError as e:
+        print(warning_line(f"Error processing Route53 record sets: {e}"))
+        # Try to flush any pending changes before giving up
+        if changes:
+            flush_changes()
 
 def route53_disable_dnssec_if_enabled(r53, hosted_zone_id: str, actually: bool):
     try:
@@ -986,74 +1278,416 @@ def cleanup_route53(actually: bool):
             route53_disable_dnssec_if_enabled(r53, hz_id, actually)
             route53_delete_rrsets_except_apex_ns_soa(r53, hz_id, zone_name, actually)
             route53_disassociate_all_vpcs_if_private(r53, hz_id, actually)
+
+            # Give Route 53 a moment to process record deletions before deleting the zone
+            if actually:
+                print(info_line("Waiting for DNS changes to propagate..."))
+                time.sleep(5)
+            
             print(action_line(actually, "Delete Hosted Zone", f"{zone_name} ({hz_id})"))
             if actually:
                 safe_call(r53.delete_hosted_zone, Id=hz_id)
 
+# ---------------- Service Selection Logic ----------------
+def get_services_to_run(args):
+    """Determine which services to run based on command line arguments"""
+    
+    # Resource type mappings
+    resource_type_mapping = {
+        "compute": ["autoscaling", "ec2", "lambda"],
+        "storage": ["s3", "ecr", "dynamodb"],
+        "network": ["elbv2", "elb", "enis", "security-groups", "vpcs"],
+        "database": ["rds", "dynamodb"],
+        "security": ["iam"],
+        "containers": ["ecs", "eks", "ecr"],
+        "messaging": ["sqs", "sns"],
+        "api": ["apigateway"],
+        "monitoring": ["logs", "cloudwatch"]
+    }
+    
+    regional_services = []
+    global_services = []
+    
+    if args.services:
+        regional_services = args.services
+    elif args.global_services:
+        global_services = args.global_services
+    elif args.resource_types:
+        for resource_type in args.resource_types:
+            if resource_type in resource_type_mapping:
+                regional_services.extend(resource_type_mapping[resource_type])
+        # Remove duplicates while preserving order
+        regional_services = list(dict.fromkeys(regional_services))
+        # Handle global services for security type
+        if "security" in args.resource_types:
+            global_services = ["iam"]
+    elif args.all_global:
+        global_services = ["route53", "iam"]
+    elif args.all_resources:
+        regional_services = ["autoscaling", "ec2", "lambda", "ecs", "eks", "s3", "ecr", "logs", "cloudwatch", 
+                           "acm", "apigateway", "dynamodb", "sqs", "sns", "elbv2", "elb", "rds", 
+                           "enis", "security-groups", "vpcs"]
+        global_services = ["route53", "iam"]
+    else:
+        # Default: all resources (regional + global)
+        regional_services = ["autoscaling", "ec2", "lambda", "ecs", "eks", "s3", "ecr", "logs", "cloudwatch", 
+                           "acm", "apigateway", "dynamodb", "sqs", "sns", "elbv2", "elb", "rds", 
+                           "enis", "security-groups", "vpcs"]
+        global_services = ["route53", "iam"]
+    
+    return regional_services, global_services
+
 # ---------------- Orchestration ----------------
-def per_region_worker(region: str, actually: bool, rds_final_snapshot_prefix: str|None):
-    print(f"\n=== Region: {region} ===")
-    # Compute first (ASG before EC2 to handle dependencies)
-    cleanup_autoscaling(region, actually)
-    cleanup_ec2(region, actually)
-    cleanup_lambda(region, actually)
-
-    # Container/orchestrators before network teardown
-    cleanup_eks(region, actually)
-
-    # Storage/registries/logs
-    cleanup_s3(region, actually)
-    cleanup_ecr(region, actually)
-    cleanup_logs(region, actually)
-    cleanup_acm(region, actually)
-
-    # Load balancers (depend on subnets)
-    cleanup_elbv2(region, actually)
-    cleanup_elb_classic(region, actually)
-
-    # RDS (before killing VPC)
-    cleanup_rds(region, actually, rds_final_snapshot_prefix)
-
-    # Network interfaces & SGs (to unblock VPC)
-    cleanup_enis(region, actually)
-    cleanup_security_groups(region, actually)
-
-    # VPC teardown (last)
-    cleanup_vpcs(region, actually)
+def per_region_worker(region: str, actually: bool, rds_final_snapshot_prefix: str|None, selected_services: list):
+    print(service_header(f"🌍 Region: {region}"))
+    
+    # Service execution mapping with proper dependency order
+    service_functions = {
+        # Compute first (ASG before EC2 to handle dependencies)
+        "autoscaling": lambda: cleanup_autoscaling(region, actually),
+        "ec2": lambda: cleanup_ec2(region, actually),
+        "lambda": lambda: cleanup_lambda(region, actually),
+        
+        # Container/orchestrators before network teardown
+        "ecs": lambda: cleanup_ecs(region, actually),
+        "eks": lambda: cleanup_eks(region, actually),
+        
+        # Storage/registries/logs
+        "s3": lambda: cleanup_s3(region, actually),
+        "ecr": lambda: cleanup_ecr(region, actually),
+        "logs": lambda: cleanup_logs(region, actually),
+        "cloudwatch": lambda: cleanup_cloudwatch(region, actually),
+        "acm": lambda: cleanup_acm(region, actually),
+        
+        # APIs and messaging
+        "apigateway": lambda: cleanup_apigateway(region, actually),
+        "dynamodb": lambda: cleanup_dynamodb(region, actually),
+        "sqs": lambda: cleanup_sqs(region, actually),
+        "sns": lambda: cleanup_sns(region, actually),
+        
+        # Load balancers (depend on subnets)
+        "elbv2": lambda: cleanup_elbv2(region, actually),
+        "elb": lambda: cleanup_elb_classic(region, actually),
+        
+        # Databases
+        "rds": lambda: cleanup_rds(region, actually, rds_final_snapshot_prefix),
+        
+        # Network interfaces & SGs (to unblock VPC)
+        "enis": lambda: cleanup_enis(region, actually),
+        "security-groups": lambda: cleanup_security_groups(region, actually),
+        
+        # VPC teardown (last)
+        "vpcs": lambda: cleanup_vpcs(region, actually)
+    }
+    
+    # Execute selected services in dependency order
+    execution_order = ["autoscaling", "ec2", "lambda", "ecs", "eks", "s3", "ecr", "logs", "cloudwatch", 
+                      "acm", "apigateway", "dynamodb", "sqs", "sns", "elbv2", "elb", "rds", 
+                      "enis", "security-groups", "vpcs"]
+    
+    for service in execution_order:
+        if service in selected_services and service in service_functions:
+            service_functions[service]()
 
     return region
 
+# ---------------- Interactive GUI Functions ----------------
+def show_interactive_menu():
+    """Show interactive GUI menu for service selection"""
+    if not GUI_AVAILABLE:
+        print(f"\n{error_line('Interactive mode not available - Missing inquirer library')}")
+        print(info_line("Install with: pip install inquirer"))
+        print(info_line("Falling back to command-line mode. Use --help for options."))
+        return None
+    
+    print(f"\n{section_header('🚀 AWS CLEANUP TOOL - INTERACTIVE MODE')}")
+    print(info_line("Use arrow keys to navigate, space to select/deselect, enter to confirm"))
+    print()
+    
+    # Main selection type
+    selection_type = inquirer.list_input(
+        "How would you like to select services?",
+        choices=[
+            ("Select specific services", "services"),
+            ("Select by resource type", "resource-types"),
+            ("Select all regional services", "all-regional"),
+            ("Select all global services", "all-global"),
+            ("Select all services (regional + global)", "all-resources"),
+            ("Exit", "exit")
+        ]
+    )
+    
+    if selection_type == "exit":
+        print("👋 Goodbye!")
+        sys.exit(0)
+    
+    # Service mappings
+    all_regional_services = [
+        ("Auto Scaling Groups", "autoscaling"),
+        ("EC2 Instances & Resources", "ec2"),
+        ("Lambda Functions", "lambda"),
+        ("ECS (Containers)", "ecs"),
+        ("EKS (Kubernetes)", "eks"),
+        ("S3 Buckets", "s3"),
+        ("ECR Repositories", "ecr"),
+        ("CloudWatch Logs", "logs"),
+        ("CloudWatch Alarms & Dashboards", "cloudwatch"),
+        ("ACM Certificates", "acm"),
+        ("API Gateway", "apigateway"),
+        ("DynamoDB Tables", "dynamodb"),
+        ("SQS Queues", "sqs"),
+        ("SNS Topics", "sns"),
+        ("Load Balancers (ALB/NLB)", "elbv2"),
+        ("Classic Load Balancers", "elb"),
+        ("RDS Databases", "rds"),
+        ("Network Interfaces (ENI)", "enis"),
+        ("Security Groups", "security-groups"),
+        ("VPCs", "vpcs")
+    ]
+    
+    all_global_services = [
+        ("Route 53 DNS", "route53"),
+        ("IAM (Policies, Roles, etc.)", "iam")
+    ]
+    
+    resource_types = [
+        ("Compute (ASG, EC2, Lambda)", "compute"),
+        ("Storage (S3, ECR, DynamoDB)", "storage"),
+        ("Network (LB, ENI, SG, VPC)", "network"),
+        ("Database (RDS, DynamoDB)", "database"),
+        ("Security (IAM)", "security"),
+        ("Containers (ECS, EKS, ECR)", "containers"),
+        ("Messaging (SQS, SNS)", "messaging"),
+        ("API (API Gateway)", "api"),
+        ("Monitoring (CloudWatch, Logs)", "monitoring")
+    ]
+    
+    selected_services = []
+    selected_global_services = []
+    
+    if selection_type == "services":
+        # Multi-select regional services
+        selected_services = inquirer.checkbox(
+            "Select regional services to clean up",
+            choices=all_regional_services
+        )
+        
+        # Ask about global services
+        include_global = inquirer.confirm("Also include global services?", default=False)
+        if include_global:
+            selected_global_services = inquirer.checkbox(
+                "Select global services to clean up",
+                choices=all_global_services
+            )
+    
+    elif selection_type == "resource-types":
+        selected_types = inquirer.checkbox(
+            "Select resource types to clean up",
+            choices=resource_types
+        )
+        
+        # Map resource types to services
+        resource_type_mapping = {
+            "compute": ["autoscaling", "ec2", "lambda"],
+            "storage": ["s3", "ecr", "dynamodb"],
+            "network": ["elbv2", "elb", "enis", "security-groups", "vpcs"],
+            "database": ["rds", "dynamodb"],
+            "security": ["iam"],
+            "containers": ["ecs", "eks", "ecr"],
+            "messaging": ["sqs", "sns"],
+            "api": ["apigateway"],
+            "monitoring": ["logs", "cloudwatch"]
+        }
+        
+        selected_services = []
+        for resource_type in selected_types:
+            selected_services.extend(resource_type_mapping.get(resource_type, []))
+        
+        # Remove duplicates and handle global services
+        selected_services = list(set(selected_services))
+        if "iam" in selected_services:
+            selected_services.remove("iam")
+            selected_global_services = ["iam"]
+    
+    elif selection_type == "all-regional":
+        selected_services = [service[1] for service in all_regional_services]
+    
+    elif selection_type == "all-global":
+        selected_global_services = [service[1] for service in all_global_services]
+    
+    elif selection_type == "all-resources":
+        selected_services = [service[1] for service in all_regional_services]
+        selected_global_services = [service[1] for service in all_global_services]
+    
+    # Additional options
+    print()
+    dry_run = inquirer.confirm("DRY-RUN mode? (Recommended - shows what would be deleted without actually deleting)", default=True)
+    
+    # Region selection
+    print()
+    all_regions = inquirer.confirm("Clean up in ALL AWS regions?", default=True)
+    selected_regions = None
+    if not all_regions:
+        common_regions = [
+            "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+            "eu-west-1", "eu-west-2", "eu-central-1",
+            "ap-southeast-1", "ap-southeast-2", "ap-northeast-1"
+        ]
+        selected_regions = inquirer.checkbox(
+            "Select specific regions",
+            choices=common_regions
+        )
+    
+    # RDS snapshot option
+    rds_snapshot_prefix = None
+    if "rds" in selected_services:
+        create_snapshots = inquirer.confirm("Create final RDS snapshots before deletion?", default=False)
+        if create_snapshots:
+            rds_snapshot_prefix = inquirer.text("Enter snapshot prefix", default="cleanup-final")
+    
+    # Summary
+    print(section_header("CLEANUP SUMMARY"))
+    
+    if dry_run:
+        print(info_line("DRY-RUN MODE - No actual deletions will be performed"))
+    else:
+        print(error_line("LIVE MODE - Resources will be permanently deleted!"))
+    
+    print(summary_item("Regions", "All regions" if all_regions else f"Selected: {', '.join(selected_regions)}"))
+    
+    if selected_services:
+        print(summary_item("Regional Services", f"{len(selected_services)} services"))
+    if selected_global_services:
+        print(summary_item("Global Services", f"{len(selected_global_services)} services"))
+    if rds_snapshot_prefix:
+        print(summary_item("RDS Snapshots", f"Create with prefix '{rds_snapshot_prefix}'"))
+    
+    # Final confirmation
+    if not dry_run:
+        print(f"\n{error_line('WARNING: This will PERMANENTLY DELETE AWS resources!')}")
+        confirm = inquirer.confirm("Are you absolutely sure you want to proceed?", default=False)
+        if not confirm:
+            print(f"\n{info_line('Operation cancelled by user. No changes made.')}")
+            sys.exit(0)
+    
+    # Build arguments object
+    class Args:
+        def __init__(self):
+            self.actually = not dry_run
+            self.regions = selected_regions
+            self.rds_final_snapshot_prefix = rds_snapshot_prefix
+            self.services = None
+            self.global_services = None
+            self.resource_types = None
+            self.all_regional = False
+            self.all_global = False
+            self.all_resources = False
+            
+            # Set the appropriate selection method
+            if selection_type == "services":
+                self.services = selected_services if selected_services else None
+                self.global_services = selected_global_services if selected_global_services else None
+            elif selection_type == "all-regional":
+                self.all_regional = True
+            elif selection_type == "all-global":
+                self.all_global = True
+            elif selection_type == "all-resources":
+                self.all_resources = True
+            else:
+                # resource-types case - we already mapped to services above
+                self.services = selected_services if selected_services else None
+                self.global_services = selected_global_services if selected_global_services else None
+    
+    return Args()
+
 def main():
-    parser = argparse.ArgumentParser(description="Dangerous account cleanup — DRY-RUN by default.")
-    parser.add_argument("--really-delete", action="store_true", help="Actually perform deletions.")
-    parser.add_argument("--regions", nargs="*", help="Limit to these regions (default: all).")
-    parser.add_argument("--include-route53", action="store_true", help="Include Route 53 hosted zone deletions (global).")
-    parser.add_argument("--include-iam", action="store_true", help="Include IAM customer-managed policy deletions (global).")
-    parser.add_argument("--rds-final-snapshot-prefix", help="If set, create final RDS snapshots with this prefix (else SkipFinalSnapshot=True).")
-    args = parser.parse_args()
+    # Check if running in interactive mode (no arguments provided)
+    if len(sys.argv) == 1:
+        # No arguments provided, try to show interactive GUI
+        args = show_interactive_menu()
+        if args is None:
+            # GUI not available, show help and exit
+            print(info_line("Run with --help to see command-line options."))
+            return
+    else:
+        # Parse command-line arguments
+        parser = argparse.ArgumentParser(description="Dangerous account cleanup — DRY-RUN by default. Cleans ALL resources (regional + global) unless specific services are selected.")
+        parser.add_argument("--really-delete", action="store_true", help="Actually perform deletions.")
+        parser.add_argument("--regions", nargs="*", help="Limit to these regions (default: all).")
+        parser.add_argument("--rds-final-snapshot-prefix", help="If set, create final RDS snapshots with this prefix (else SkipFinalSnapshot=True).")
+        parser.add_argument("--gui", action="store_true", help="Launch interactive GUI mode.")
+        
+        # Service selection arguments
+        service_group = parser.add_mutually_exclusive_group()
+        service_group.add_argument("--services", nargs="+", 
+                                  choices=["autoscaling", "ec2", "lambda", "s3", "ecr", "logs", "cloudwatch", "acm", 
+                                          "apigateway", "dynamodb", "sqs", "sns", "elbv2", "elb", "rds", "ecs", "eks", 
+                                          "enis", "security-groups", "vpcs"],
+                                  help="Select specific regional services to clean up")
+        service_group.add_argument("--global-services", nargs="+",
+                                  choices=["route53", "iam"],
+                                  help="Select specific global services to clean up")
+        service_group.add_argument("--resource-types", nargs="+",
+                                  choices=["compute", "storage", "network", "database", "security", "containers", 
+                                          "messaging", "api", "monitoring"],
+                                  help="Select resource types to clean up")
+        service_group.add_argument("--all-regional", action="store_true",
+                                  help="Clean up all regional services only")
+        service_group.add_argument("--all-global", action="store_true", 
+                                  help="Clean up all global services only")
+        service_group.add_argument("--all-resources", action="store_true",
+                                  help="Clean up all regional and global services (same as default)")
+        
+        args = parser.parse_args()
+        
+        # Handle GUI mode from command line
+        if args.gui:
+            args = show_interactive_menu()
+            if args is None:
+                print(error_line("Interactive mode not available - Install with: pip install inquirer"))
+                return
+        
+        # Convert argparse args to our Args object for consistency
+        args.actually = args.really_delete
 
     acct = confirm_account()
-    print(f"Account: {acct}")
+    print(section_header("AWS CLEANUP CONFIGURATION"))
 
+    # Get selected services
+    regional_services, global_services = get_services_to_run(args)
     target_regions = args.regions or regions()
-    print(f"Regions: {', '.join(target_regions)}")
-    if not args.really_delete:
-        print("MODE: DRY-RUN (no delete calls will be made)")
+    
+    # Clean summary display
+    print(summary_item("Account ID", acct))
+    print(summary_item("Target Regions", f"{len(target_regions)} regions"))
+    if regional_services:
+        print(summary_item("Regional Services", f"{len(regional_services)} services"))
+    if global_services:
+        print(summary_item("Global Services", f"{len(global_services)} services"))
+    
+    print()
+    if not args.actually:
+        print(info_line("DRY-RUN MODE - No actual deletions will be performed"))
+    else:
+        print(error_line("LIVE MODE - Resources will be permanently deleted!"))
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(per_region_worker, r, args.really_delete, args.rds_final_snapshot_prefix) for r in target_regions]
-        for f in as_completed(futures):
-            _ = f.result()
+    # Per-region cleanup (in parallel) - only if regional services selected
+    if regional_services:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = [ex.submit(per_region_worker, r, args.actually, args.rds_final_snapshot_prefix, regional_services) for r in target_regions]
+            for f in as_completed(futures):
+                _ = f.result()
 
-    if args.include_route53:
-        print("\n=== Global: Route 53 ===")
-        cleanup_route53(args.really_delete)
+    # Global cleanup
+    if "route53" in global_services:
+        print(service_header("🌐 Route 53 DNS (Global)"))
+        cleanup_route53(args.actually)
 
-    if args.include_iam:
-        print("\n=== Global: IAM ===")
-        cleanup_iam(args.really_delete)
+    if "iam" in global_services:
+        print(service_header("🔐 IAM Resources (Global)"))
+        cleanup_iam(args.actually)
 
-    print("\nDone.")
+    print(f"\n{success_line('All AWS cleanup operations completed! 🎉')}")
 
 if __name__ == "__main__":
     main()

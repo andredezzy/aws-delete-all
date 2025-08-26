@@ -14,12 +14,18 @@ This script will **DELETE ALL RESOURCES** in the specified AWS account. Use with
 - **S3**: Empties and deletes buckets (handles both versioned and unversioned buckets, bucket-region aware)
 - **ECR**: Force deletes repositories and their images
 - **CloudWatch Logs**: Deletes all log groups
+- **CloudWatch**: Deletes alarms, dashboards
 - **ACM**: Deletes SSL/TLS certificates and their dependent resources (load balancers, CloudFront distributions, API Gateway domains)
+- **API Gateway**: Deletes REST APIs, HTTP APIs, WebSocket APIs, and custom domains (both v1 and v2)
+- **DynamoDB**: Deletes tables (removes deletion protection), global tables, and backups
+- **SQS**: Deletes queues (standard and FIFO)
+- **SNS**: Deletes topics and subscriptions
 - **ENI**: Deletes available network interfaces
 - **Security Groups**: Revokes all rules, removes cross-references, and deletes non-default security groups
 - **Load Balancers**: Deletes ALB/NLB (ELBv2) and Classic ELB load balancers, plus target groups
 - **VPC**: Comprehensive teardown including endpoints, NAT gateways, internet gateways (detach first), subnets, non-main route tables, non-default NACLs, peering connections, VPN attachments/gateways, then VPCs
 - **RDS**: Deletes DB clusters and instances (removes deletion protection), snapshots, and subnet groups
+- **ECS**: Deletes services, clusters, and capacity providers (excludes AWS-managed Fargate providers)
 - **EKS**: Deletes add-ons, Fargate profiles, nodegroups, and clusters; attempts to remove IAM OIDC providers
 
 ### Global Services (opt-in)
@@ -46,7 +52,13 @@ The script requires extensive AWS permissions. Consider using a policy with the 
 - `logs:*` (log groups)
 - `acm:*` (SSL/TLS certificates)
 - `cloudfront:*` (CloudFront distributions using certificates)
-- `apigateway:*` (API Gateway custom domains using certificates)
+- `apigateway:*` (API Gateway REST APIs, custom domains)
+- `apigatewayv2:*` (API Gateway HTTP/WebSocket APIs, custom domains)
+- `dynamodb:*` (DynamoDB tables, backups)
+- `sqs:*` (SQS queues)
+- `sns:*` (SNS topics, subscriptions)
+- `cloudwatch:*` (CloudWatch alarms, dashboards)
+- `ecs:*` (ECS clusters, services, capacity providers)
 - `elbv2:*` (Application/Network Load Balancers, target groups)
 - `elasticloadbalancing:*` (Classic Load Balancers)
 - `rds:*` (DB instances, clusters, snapshots, subnet groups)
@@ -80,8 +92,14 @@ The script requires extensive AWS permissions. Consider using a policy with the 
 
 3. Install dependencies:
    ```bash
-   pip install boto3
+   # Install all dependencies from requirements.txt (recommended)
+   pip install -r requirements.txt
+   
+   # Or install manually:
+   # pip install boto3 inquirer
    ```
+   
+   **Note:** The `requirements.txt` file includes both core dependencies (`boto3`) and optional GUI dependencies (`inquirer`).
 
 4. Configure AWS credentials (see AWS Configuration section below)
 
@@ -90,8 +108,14 @@ The script requires extensive AWS permissions. Consider using a policy with the 
 1. Clone or download the script
 2. Install dependencies globally:
    ```bash
-   pip install boto3
+   # Install all dependencies from requirements.txt (recommended)
+   pip install -r requirements.txt
+   
+   # Or install manually:
+   # pip install boto3 inquirer
    ```
+   
+   **Note:** The `requirements.txt` file includes both core dependencies (`boto3`) and optional GUI dependencies (`inquirer`).
 
 ### AWS Configuration
 
@@ -120,46 +144,163 @@ rmdir /s venv  # Windows
 
 ## Usage
 
-### Basic Commands
+### 🚀 Quick Start
+
+**New to this tool? Start here:**
+
+1. **Safe exploration** (recommended first step):
+   ```bash
+   python aws_cleanup.py
+   ```
+   - Launches interactive GUI
+   - Shows what would be deleted (DRY-RUN mode)
+   - No actual changes made to your AWS account
+
+2. **Ready to clean up?** Re-run and choose "actual deletion" when prompted
+
+3. **Command-line user?** Use `python aws_cleanup.py` for DRY-RUN
+
+### 🎯 Interactive GUI Mode (Recommended)
+
+The easiest way to use this tool is through the interactive GUI mode:
 
 ```bash
-# DRY-RUN mode (default) - shows what would be deleted without actually deleting
+python aws_cleanup.py
+```
+
+**Features:**
+- 🎮 **Arrow key navigation** - Navigate menus intuitively
+- ☑️ **Checkbox selection** - Multi-select services with spacebar
+- 🛡️ **Safety first** - DRY-RUN mode is default and highlighted
+- 📋 **Guided workflow** - Step-by-step prompts for all options
+- 👀 **Visual confirmation** - Clear summary before any action
+- 🔰 **Beginner-friendly** - No command-line knowledge required
+
+**Interactive Workflow:**
+1. **Selection Method** → Choose how to select services (specific services, resource types, or bulk options)
+2. **Service Selection** → Multi-select from organized lists with descriptions
+3. **Global Services** → Optionally include Route 53 DNS and IAM resources
+4. **Safety Mode** → Choose DRY-RUN (recommended) or actual deletion
+5. **Regions** → Select all regions or specific ones
+6. **RDS Options** → Configure final snapshots if RDS is selected
+7. **Confirmation** → Review summary and confirm before execution
+
+**Alternative launch:**
+```bash
+python aws_cleanup.py --gui
+```
+
+**Requirements:** Requires `inquirer` library. If not installed, falls back to command-line help.
+
+### 💻 Command-Line Mode
+
+For automation, scripting, or advanced users who prefer command-line interfaces:
+
+**Basic Usage:**
+```bash
+# DRY-RUN mode (shows what would be deleted, safe to run)
 python aws_cleanup.py
 
-# DRY-RUN for specific regions only
+# DRY-RUN for specific regions
 python aws_cleanup.py --regions us-east-1 us-west-2
 
-# DRY-RUN including Route 53 cleanup
-python aws_cleanup.py --include-route53
+# ACTUAL DELETION (⚠️ DANGEROUS!) - deletes ALL resources by default
+python aws_cleanup.py --really-delete
+```
 
-# DRY-RUN including IAM cleanup
-python aws_cleanup.py --include-iam
-
-# DRY-RUN including both global services
-python aws_cleanup.py --include-route53 --include-iam
-
-# ACTUALLY DELETE resources (DANGEROUS!)
+**RDS Snapshot Control:**
+```bash
+# Skip final snapshots (faster, default)
 python aws_cleanup.py --really-delete
 
-# ACTUALLY DELETE including Route 53
-python aws_cleanup.py --really-delete --include-route53
+# Create final snapshots before deletion
+python aws_cleanup.py --really-delete --rds-final-snapshot-prefix backup-$(date +%s)
+```
 
-# ACTUALLY DELETE including IAM
-python aws_cleanup.py --really-delete --include-iam
+### 🎯 Selective Service Cleanup
 
-# Control RDS final snapshots (default: skip final snapshots)
-python aws_cleanup.py --really-delete --rds-final-snapshot-prefix final-$(date +%s)
+**By Specific Services:**
+```bash
+# Clean specific regional services
+python aws_cleanup.py --services ec2 s3 rds dynamodb
+
+# Clean specific global services  
+python aws_cleanup.py --global-services route53 iam
+
+# Combine regional and global
+python aws_cleanup.py --services ec2 s3 --global-services iam
+```
+
+**By Resource Types:**
+```bash
+# Clean compute resources (ASG, EC2, Lambda)
+python aws_cleanup.py --resource-types compute
+
+# Clean storage resources (S3, ECR, DynamoDB)
+python aws_cleanup.py --resource-types storage
+
+# Clean multiple types
+python aws_cleanup.py --resource-types compute storage network
+
+# All available types: compute, storage, network, database, security, containers, messaging, api, monitoring
+```
+
+**Bulk Operations:**
+```bash
+# All regional services only (excludes Route 53 & IAM)
+python aws_cleanup.py --all-regional
+
+# All global services only (Route 53 & IAM)
+python aws_cleanup.py --all-global  
+
+# Everything explicitly (same as default behavior)
+python aws_cleanup.py --all-resources
+
+# Note: Running without service selection defaults to ALL resources (regional + global)
+```
+
+**Advanced Combinations:**
+```bash
+# Specific services in specific regions with snapshots
+python aws_cleanup.py --services rds dynamodb --regions us-east-1 us-west-2 --rds-final-snapshot-prefix backup-$(date +%s)
+
+# Actual deletion of compute resources in production regions
+python aws_cleanup.py --resource-types compute --regions us-east-1 eu-west-1 --really-delete
 ```
 
 ### Command Line Options
 
 | Option | Description |
 |--------|-------------|
+| `--gui` | Launch interactive GUI mode with arrow key navigation |
 | `--really-delete` | Actually perform deletions (otherwise runs in DRY-RUN mode) |
 | `--regions` | Specify regions to clean (default: all available regions) |
-| `--include-route53` | Include Route 53 hosted zone deletions (global service) |
-| `--include-iam` | Include IAM identity providers and customer-managed policy deletions (global service) |
 | `--rds-final-snapshot-prefix` | Create final RDS snapshots with this prefix (default: skip final snapshots) |
+
+### Service Selection Options (Mutually Exclusive)
+
+| Option | Description |
+|--------|-------------|
+| `--services` | Select specific regional services: `autoscaling`, `ec2`, `lambda`, `s3`, `ecr`, `logs`, `cloudwatch`, `acm`, `apigateway`, `dynamodb`, `sqs`, `sns`, `elbv2`, `elb`, `rds`, `ecs`, `eks`, `enis`, `security-groups`, `vpcs` |
+| `--global-services` | Select specific global services: `route53`, `iam` |
+| `--resource-types` | Select by resource type: `compute`, `storage`, `network`, `database`, `security`, `containers`, `messaging`, `api`, `monitoring` |
+| `--all-regional` | Clean up all regional services (default behavior) |
+| `--all-global` | Clean up all global services |
+| `--all-resources` | Clean up all regional and global services |
+
+### Resource Type Mappings
+
+| Resource Type | Included Services |
+|---------------|-------------------|
+| `compute` | Auto Scaling Groups, EC2 instances, Lambda functions |
+| `storage` | S3 buckets, ECR repositories, DynamoDB tables |
+| `network` | Load balancers (ALB/NLB/Classic), ENIs, Security Groups, VPCs |
+| `database` | RDS instances and clusters, DynamoDB tables |
+| `security` | IAM (global service) |
+| `containers` | ECS clusters, EKS clusters, ECR repositories |
+| `messaging` | SQS queues, SNS topics |
+| `api` | API Gateway (REST/HTTP/WebSocket APIs) |
+| `monitoring` | CloudWatch Logs, CloudWatch alarms/dashboards |
 
 ### Environment Variables
 
