@@ -499,8 +499,8 @@ def cleanup_rds(region: str, actually: bool, final_snapshot_prefix: str|None):
                         break
                     except ClientError as e:
                         if "InvalidDBSubnetGroupStateFault" in str(e) and attempt < 2:
-                            print(f"  Subnet group {name} still in use, waiting 30s (attempt {attempt + 1}/3)...")
-                            time.sleep(30)
+                            print(f"  Subnet group {name} still in use, waiting 2min (attempt {attempt + 1}/3)...")
+                            time.sleep(120)
                         else:
                             print(f"  ! Failed to delete subnet group {name}: {e}", file=sys.stderr)
                             break
