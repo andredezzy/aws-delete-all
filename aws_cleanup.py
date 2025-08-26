@@ -8,6 +8,7 @@ Per-region cleanup:
 - S3: empties versioned/unversioned buckets then deletes them (bucket-region aware)
 - ECR: repositories (force delete images)
 - CloudWatch Logs: log groups
+- ACM: SSL/TLS certificates
 - ENI: deletes 'available' network interfaces
 - Security Groups: revokes rules, removes cross-references, deletes non-default SGs
 - Load Balancers: ALB/NLB (ELBv2) + Classic ELB, target groups
@@ -261,6 +262,97 @@ def cleanup_logs(region: str, actually: bool):
             if actually:
                 safe_call(logs.delete_log_group, logGroupName=name)
 
+# ---------------- ACM (Certificate Manager) ----------------
+def cleanup_acm(region: str, actually: bool):
+    acm = boto3.client("acm", region_name=region, config=CFG)
+    
+    try:
+        paginator = acm.get_paginator("list_certificates")
+        for page in paginator.paginate():
+            for cert in page.get("CertificateSummaryList", []):
+                cert_arn = cert["CertificateArn"]
+                domain_name = cert.get("DomainName", "unknown")
+                
+                # Check what resources are using this certificate and delete them first
+                try:
+                    cert_details = acm.describe_certificate(CertificateArn=cert_arn)
+                    in_use_by = cert_details.get("Certificate", {}).get("InUseBy", [])
+                    
+                    if in_use_by:
+                        print(action_line(actually, "ACM Certificate in use, deleting dependent resources", f"{region} {domain_name} (used by {len(in_use_by)} resources)"))
+                        
+                        for resource_arn in in_use_by:
+                            delete_resource_using_certificate(region, resource_arn, actually)
+                except ClientError:
+                    pass
+                
+                print(action_line(actually, "Delete ACM Certificate", f"{region} {domain_name} ({cert_arn})"))
+                if actually:
+                    safe_call(acm.delete_certificate, CertificateArn=cert_arn)
+    except ClientError:
+        pass
+
+def delete_resource_using_certificate(region: str, resource_arn: str, actually: bool):
+    """Delete resources that are using ACM certificates"""
+    try:
+        # Parse the ARN to determine resource type
+        arn_parts = resource_arn.split(":")
+        if len(arn_parts) < 6:
+            return
+        
+        service = arn_parts[2]
+        resource_type_and_id = arn_parts[5]
+        
+        if service == "elasticloadbalancing":
+            # ELB/ALB/NLB
+            if "loadbalancer/" in resource_type_and_id:
+                lb_arn = resource_arn
+                print(action_line(actually, "Delete Load Balancer (using certificate)", f"{region} {lb_arn}"))
+                if actually:
+                    if "app/" in resource_type_and_id or "net/" in resource_type_and_id:
+                        # ALB/NLB
+                        elbv2 = boto3.client("elbv2", region_name=region, config=CFG)
+                        safe_call(elbv2.delete_load_balancer, LoadBalancerArn=lb_arn)
+                    else:
+                        # Classic ELB
+                        elb = boto3.client("elb", region_name=region, config=CFG)
+                        lb_name = resource_type_and_id.split("/")[-1]
+                        safe_call(elb.delete_load_balancer, LoadBalancerName=lb_name)
+        
+        elif service == "cloudfront":
+            # CloudFront Distribution
+            distribution_id = resource_type_and_id.split("/")[-1]
+            print(action_line(actually, "Delete CloudFront Distribution (using certificate)", f"{region} {distribution_id}"))
+            if actually:
+                cloudfront = boto3.client("cloudfront", config=CFG)
+                try:
+                    # Get distribution config first
+                    resp = cloudfront.get_distribution_config(Id=distribution_id)
+                    config = resp["DistributionConfig"]
+                    etag = resp["ETag"]
+                    
+                    # Disable distribution first
+                    config["Enabled"] = False
+                    cloudfront.update_distribution(Id=distribution_id, DistributionConfig=config, IfMatch=etag)
+                    print(f"  CloudFront distribution {distribution_id} disabled, will need manual deletion after propagation")
+                except ClientError as e:
+                    print(f"  ! Failed to disable CloudFront distribution {distribution_id}: {e}", file=sys.stderr)
+        
+        elif service == "apigateway":
+            # API Gateway Custom Domain
+            if "domainnames/" in resource_type_and_id:
+                domain_name = resource_type_and_id.split("/")[-1]
+                print(action_line(actually, "Delete API Gateway Domain Name (using certificate)", f"{region} {domain_name}"))
+                if actually:
+                    apigateway = boto3.client("apigateway", region_name=region, config=CFG)
+                    safe_call(apigateway.delete_domain_name, domainName=domain_name)
+        
+        else:
+            print(f"  ! Unknown resource type using certificate: {resource_arn}", file=sys.stderr)
+    
+    except Exception as e:
+        print(f"  ! Failed to delete resource using certificate {resource_arn}: {e}", file=sys.stderr)
+
 # ---------------- Load Balancers ----------------
 def cleanup_elbv2(region: str, actually: bool):
     elb = boto3.client("elbv2", region_name=region, config=CFG)
@@ -307,6 +399,32 @@ def cleanup_vpcs(region: str, actually: bool):
         vpc_id = vpc["VpcId"]
         print(action_line(actually, "VPC teardown (best-effort)", f"{region} {vpc_id}"))
 
+        # Release any remaining Elastic IPs in this VPC first
+        try:
+            addrs = ec2.describe_addresses()["Addresses"]
+            for a in addrs:
+                # Check if EIP is associated with resources in this VPC
+                if a.get("NetworkInterfaceId") or a.get("InstanceId"):
+                    try:
+                        vpc_match = False
+                        if a.get("NetworkInterfaceId"):
+                            eni = ec2.describe_network_interfaces(NetworkInterfaceIds=[a["NetworkInterfaceId"]])["NetworkInterfaces"][0]
+                            vpc_match = eni.get("VpcId") == vpc_id
+                        elif a.get("InstanceId"):
+                            inst = ec2.describe_instances(InstanceIds=[a["InstanceId"]])["Reservations"][0]["Instances"][0]
+                            vpc_match = inst.get("VpcId") == vpc_id
+                        
+                        if vpc_match:
+                            alloc = a.get("AllocationId")
+                            if alloc:
+                                print(action_line(actually, "Release Elastic IP (VPC cleanup)", f"{region} {alloc}"))
+                                if actually:
+                                    safe_call(ec2.release_address, AllocationId=alloc)
+                    except ClientError:
+                        pass
+        except ClientError:
+            pass
+
         # Endpoints (interface & gateway)
         try:
             eps = ec2.describe_vpc_endpoints(Filters=[{"Name":"vpc-id","Values":[vpc_id]}])["VpcEndpoints"]
@@ -318,11 +436,12 @@ def cleanup_vpcs(region: str, actually: bool):
 
         # NAT Gateways
         try:
-            ngw = ec2.describe_nat_gateways(Filter=[{"Name":"vpc-id","Values":[vpc_id]}])["NatGateways"]
+            ngw = ec2.describe_nat_gateways(Filters=[{"Name":"vpc-id","Values":[vpc_id]}])["NatGateways"]
             for n in ngw:
-                print(action_line(actually, "Delete NAT Gateway", f"{region} {n['NatGatewayId']}"))
-                if actually:
-                    safe_call(ec2.delete_nat_gateway, NatGatewayId=n["NatGatewayId"])
+                if n.get("State") not in ("deleted", "deleting"):
+                    print(action_line(actually, "Delete NAT Gateway", f"{region} {n['NatGatewayId']}"))
+                    if actually:
+                        safe_call(ec2.delete_nat_gateway, NatGatewayId=n["NatGatewayId"])
         except ClientError: pass
 
         # Internet Gateways (detach then delete)
@@ -851,6 +970,7 @@ def per_region_worker(region: str, actually: bool, rds_final_snapshot_prefix: st
     cleanup_s3(region, actually)
     cleanup_ecr(region, actually)
     cleanup_logs(region, actually)
+    cleanup_acm(region, actually)
 
     # Load balancers (depend on subnets)
     cleanup_elbv2(region, actually)

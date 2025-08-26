@@ -14,6 +14,7 @@ This script will **DELETE ALL RESOURCES** in the specified AWS account. Use with
 - **S3**: Empties and deletes buckets (handles both versioned and unversioned buckets, bucket-region aware)
 - **ECR**: Force deletes repositories and their images
 - **CloudWatch Logs**: Deletes all log groups
+- **ACM**: Deletes SSL/TLS certificates and their dependent resources (load balancers, CloudFront distributions, API Gateway domains)
 - **ENI**: Deletes available network interfaces
 - **Security Groups**: Revokes all rules, removes cross-references, and deletes non-default security groups
 - **Load Balancers**: Deletes ALB/NLB (ELBv2) and Classic ELB load balancers, plus target groups
@@ -42,6 +43,9 @@ The script requires extensive AWS permissions. Consider using a policy with the 
 - `ecr:*` (repositories)
 - `lambda:*` (functions)
 - `logs:*` (log groups)
+- `acm:*` (SSL/TLS certificates)
+- `cloudfront:*` (CloudFront distributions using certificates)
+- `apigateway:*` (API Gateway custom domains using certificates)
 - `elbv2:*` (Application/Network Load Balancers, target groups)
 - `elasticloadbalancing:*` (Classic Load Balancers)
 - `rds:*` (DB instances, clusters, snapshots, subnet groups)
@@ -229,6 +233,11 @@ MODE: DRY-RUN (no delete calls will be made)
 [DRY-RUN] Delete Lambda function: us-east-1 my-function
 [DRY-RUN] Empty + delete S3 bucket: us-east-1 s3://my-test-bucket
 [DRY-RUN] Delete ECR repository (force): us-east-1 my-repo
+[DRY-RUN] ACM Certificate in use, deleting dependent resources: us-east-1 example.com (used by 2 resources)
+[DRY-RUN] Delete Load Balancer (using certificate): us-east-1 arn:aws:elasticloadbalancing:us-east-1:...
+[DRY-RUN] Delete API Gateway Domain Name (using certificate): us-east-1 api.example.com
+[DRY-RUN] Delete ACM Certificate: us-east-1 example.com (arn:aws:acm:us-east-1:123456789012:certificate/...)
+[DRY-RUN] Delete ACM Certificate: us-east-1 old-domain.com (arn:aws:acm:us-east-1:123456789012:certificate/...)
 [DRY-RUN] EKS Cluster cleanup: us-east-1 my-cluster
 [DRY-RUN] Delete EKS Nodegroup: us-east-1 my-cluster/my-nodegroup
 [DRY-RUN] Delete EKS Cluster: us-east-1 my-cluster
