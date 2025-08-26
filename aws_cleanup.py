@@ -114,7 +114,7 @@ def section_header(title: str) -> str:
 def service_header(service: str, region: str = None) -> str:
     """Format service header with clean styling"""
     location = f" ({region})" if region else ""
-    return f"\n\033[96m🔧 {service}{location}\033[0m"
+    return f"\n\033[96m{service}{location}\033[0m"
 
 def summary_item(label: str, value: str) -> str:
     """Format summary items consistently"""
